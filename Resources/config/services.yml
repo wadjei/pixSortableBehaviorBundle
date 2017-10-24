@@ -16,6 +16,15 @@ services:
         calls:
             - [ 'setPositionField', ["%pix.sortable.behavior.position.field%"]]
 
+    pix_sortable_behavior.position.jl_orm:
+        class: Pix\SortableBehaviorBundle\Services\PositionJLORMHandler
+        public: false
+        arguments:
+            - "@doctrine.orm.entity_manager"
+        calls:
+            - [ 'setPositionField', ["%pix.sortable.behavior.position.field%"]]
+            - [ 'setSortableGroups', ["%pix.sortable.behavior.sortable_groups%"]]
+
     pix_sortable_behavior.twig.extension:
         class: Pix\SortableBehaviorBundle\Twig\ObjectPositionExtension
         arguments:
