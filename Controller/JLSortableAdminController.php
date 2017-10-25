@@ -24,18 +24,18 @@ use Symfony\Component\HttpFoundation\Response;
  */
 class JLSortableAdminController extends CRUDController
 {
-    private function getPositionSetter($object, $entityClass)
+    private function getPositionSetter($entityClass)
     {
         /** @var PositionHandler $positionHandler */
         $positionHandler = $this->get('pix_sortable_behavior.position');
 
         $setter = sprintf('set%s', ucfirst($positionHandler->getPositionFieldByEntity($entityClass)));
 
-        if (!method_exists($object, $setter)) {
+        if (!method_exists($entityClass, $setter)) {
             throw new \LogicException(
                 sprintf(
                     '%s does not implement ->%s() to set the desired position.',
-                    $object,
+                    $entityClass,
                     $setter
                 )
             );
@@ -75,7 +75,7 @@ class JLSortableAdminController extends CRUDController
         $newPositionNumber  = $positionHandler->getPosition($object, $position, $lastPositionNumber);
 
         $entityClass = ClassUtils::getClass($object);
-        $setter = $this->getPositionSetter($object, $entityClass);
+        $setter = $this->getPositionSetter($entityClass);
 
         call_user_func([$object, $setter], $newPositionNumber);
         $this->admin->update($object);
@@ -115,10 +115,9 @@ class JLSortableAdminController extends CRUDController
         $parameters = json_decode($request->getContent(), true);
         $positionHandler = $this->get('pix_sortable_behavior.position');
 
-        $object = $this->admin->getSubject();
-        $entityClass = ClassUtils::getClass($object);
+        $entityClass = $this->admin->getClass();
         $positionField = $positionHandler->getPositionFieldByEntity($entityClass);
-        $setter = $this->getPositionSetter($object, $entityClass);
+        $setter = $this->getPositionSetter($entityClass);
 
         /** @var EntityManager $em */
         $em = $this->get('doctrine')->getEntityManager();
