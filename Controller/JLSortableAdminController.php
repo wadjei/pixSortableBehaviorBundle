@@ -22,7 +22,7 @@ use Symfony\Component\HttpFoundation\Response;
  *
  * @package Pix\SortableBehaviorBundle
  */
-class SortableAdminController extends CRUDController
+class JLSortableAdminController extends CRUDController
 {
     private function getPositionSetter($object, $entityClass)
     {
@@ -113,7 +113,9 @@ class SortableAdminController extends CRUDController
             'log' => [],
         ];
         $parameters = json_decode($request->getContent(), true);
+        $positionHandler = $this->get('pix_sortable_behavior.position');
 
+        $object = $this->admin->getSubject();
         $entityClass = ClassUtils::getClass($object);
         $positionField = $positionHandler->getPositionFieldByEntity($entityClass);
         $setter = $this->getPositionSetter($object, $entityClass);
