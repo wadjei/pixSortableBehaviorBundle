@@ -16,6 +16,7 @@ use Sonata\AdminBundle\Controller\CRUDController;
 use Symfony\Component\HttpFoundation\RedirectResponse;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
+use Doctrine\ORM\EntityManager;
 
 /**
  * Class SortableAdminController
@@ -24,6 +25,13 @@ use Symfony\Component\HttpFoundation\Response;
  */
 class JLSortableAdminController extends CRUDController
 {
+    /**
+     * Get the method to set this entitie's position
+     *
+     * @param string $entityClass
+     * @throws \LogicException
+     * @return string
+     */
     private function getPositionSetter($entityClass)
     {
         /** @var PositionHandler $positionHandler */
@@ -45,6 +53,67 @@ class JLSortableAdminController extends CRUDController
     }
 
     /**
+     * Get filter parameters and query for this entitie's position
+     *
+     * @param object $object
+     * @return string[]|NULL[][] (keys: string filters, array parameters)
+     */
+    private function getGroupFilter($object)
+    {
+        $filters = [];
+        $parameters = [];
+
+        /** @var PositionHandler $positionHandler */
+        $positionHandler = $this->get('pix_sortable_behavior.position');
+
+        $groups = $positionHandler->getSortableGroupsFieldByEntity($object);
+        foreach ($groups as $groupField) {
+            $proposedGetter = 'get'.ucfirst($groupField);
+            if (is_callable([$object, $proposedGetter])) {
+                $filters[] = 'e.'.$groupField.' = :group_'.$groupField;
+                $parameters['group_'.$groupField] = call_user_func([$object, $proposedGetter]);
+            }
+        }
+
+        return [
+            'filters' => implode(' AND ', $filters),
+            'parameters' => $parameters,
+        ];
+    }
+
+    /**
+     * Get a collection of objects with no sorting (zero or null)
+     *
+     * @param Object $object
+     * @return array
+     */
+    private function getUnsorted($object)
+    {
+        $entityClass = get_class($object);
+
+        /** @var EntityManager $em */
+        $em = $this->get('doctrine')->getEntityManager();
+
+        /** @var PositionHandler $positionHandler */
+        $positionHandler = $this->get('pix_sortable_behavior.position');
+        $positionField = $positionHandler->getPositionFieldByEntity($entityClass);
+        $filters = $this->getGroupFilter($object);
+
+        if (!empty($filters['filters'])) {
+            $groupRestrict = ' AND ('.$filters['filters'].')';
+        } else {
+            $groupRestrict = '';
+        }
+
+        $dql = <<<DQL
+            SELECT e
+              FROM $entityClass e
+              WHERE (e.$positionField < 1 OR e.$positionField IS NULL) $groupRestrict
+DQL;
+        return $em->createQuery($dql)->setParameters($filters['parameters'])->execute();
+    }
+
+    /**
      * Move element
      *
      * @param string $position
@@ -53,6 +122,7 @@ class JLSortableAdminController extends CRUDController
      */
     public function moveAction($position)
     {
+        $response = [];
         $translator = $this->get('translator');
 
         if (!$this->admin->isGranted('EDIT')) {
@@ -71,20 +141,116 @@ class JLSortableAdminController extends CRUDController
         $positionHandler = $this->get('pix_sortable_behavior.position');
         $object          = $this->admin->getSubject();
 
+        $currentPositionNumber = $positionHandler->getCurrentPosition($object);
         $lastPositionNumber = $positionHandler->getLastPosition($object);
         $newPositionNumber  = $positionHandler->getPosition($object, $position, $lastPositionNumber);
 
         $entityClass = ClassUtils::getClass($object);
+        $positionField = $positionHandler->getPositionFieldByEntity($entityClass);
         $setter = $this->getPositionSetter($entityClass);
 
         call_user_func([$object, $setter], $newPositionNumber);
         $this->admin->update($object);
 
+        // make a space
+        if ($currentPositionNumber > $newPositionNumber) {
+            $shift = +1;
+            $lowerBound = $newPositionNumber;
+            $upperBound = $currentPositionNumber;
+        } elseif ($currentPositionNumber < $newPositionNumber) {
+            $shift = -1;
+            $lowerBound = $currentPositionNumber;
+            $upperBound = $newPositionNumber;
+        }
+
+        $response['remap'] = [];
+
+        if (!empty($shift)) {
+            /** @var EntityManager $em */
+            $em = $this->get('doctrine')->getEntityManager();
+
+            /** @var EntityRepository $repository */
+            $repository = $em->getRepository($entityClass);
+
+            $filters = $this->getGroupFilter($object);
+
+            if (!empty($filters['filters'])) {
+                $groupRestrict = ' AND ('.$filters['filters'].')';
+            } else {
+                $groupRestrict = '';
+            }
+
+            $updateDql = <<<DQL
+                UPDATE $entityClass e
+                  SET e.$positionField = (CASE
+                    WHEN e.id = :objectId THEN :newPosition
+                    WHEN e.$positionField BETWEEN :lowerBound AND :upperBound THEN e.$positionField + :shift
+                    ELSE e.$positionField END
+                   )
+                  WHERE e.$positionField BETWEEN :lowerBound AND :upperBound $groupRestrict
+DQL;
+            $reportDql = <<<DQL
+                SELECT e.id, e.$positionField
+                  FROM $entityClass e
+                  WHERE e.$positionField BETWEEN :lowerBound AND :upperBound $groupRestrict
+DQL;
+
+            $updateParameters = array_merge(
+                $filters['parameters'],
+                [
+                    'objectId' => $object->getId(),
+                    'lowerBound' => $lowerBound,
+                    'upperBound' => $upperBound,
+                    'newPosition' => $newPositionNumber,
+                    'shift' => $shift,
+                ]
+            );
+
+            $reportParameters = array_merge(
+                $filters['parameters'],
+                [
+                    'lowerBound' => $lowerBound,
+                    'upperBound' => $upperBound,
+                ]
+            );
+
+            $em->createQuery($updateDql)->setParameters($updateParameters)->execute();
+
+            $updates = $em
+                ->createQuery($reportDql)
+                ->setParameters($reportParameters)
+                ->execute()
+                ;
+
+            foreach ($updates as $update) {
+                $response['remap'][$update['id']] = $update[$positionField];
+            }
+
+            $sorting = $positionHandler->getLastPosition($object) + 1;
+            foreach ($this->getUnsorted($object) as $item) {
+                $response['redraw_recommended'] = true;
+                $response['log'][] = "setting unassigned ".$entityClass.":{$item->getId()} sorting to {$sorting}";
+                $response['remap'][$item->getId()] = $sorting;
+                call_user_func([$item, $setter], $sorting++);
+            }
+
+            $em->flush();
+            $response['log'][] = "flushing entities";
+            $response['message'] = 'The page order has been updated successfully.';
+
+            if ($logger = $this->get('logger')) {
+                /** @var \Psr\Log\LoggerInterface $logger */
+                $logger->debug(
+                    'Move complete for '.$entityClass.':'.$object->getId(),
+                    [
+                        'response' => $response,
+                    ]
+                );
+            }
+        }
+
         if ($this->isXmlHttpRequest()) {
-            return $this->renderJson(array(
-                'result' => 'ok',
-                'objectId' => $this->admin->getNormalizedIdentifier($object)
-            ));
+            return $this->renderJson(array_merge(['result' => 'ok'], $response));
         }
 
         $this->addFlash(
@@ -139,21 +305,12 @@ class JLSortableAdminController extends CRUDController
                 call_user_func([$object, $setter], $sorting++);
             }
 
-            // amend sorting of all items with sort set to 0
-            $unassigned = $repository
-                ->createQueryBuilder($entityClass)
-                ->select('e')
-                ->from($entityClass, 'e')
-                ->where('e.'.$positionField.' < 1')
-                ->getQuery()
-                ->execute()
-                ;
-
-            foreach ($unassigned as $object) {
+            // amend sorting of all items with sort set to 0 (assume items are grouped correctly so $order is appropiate)
+            foreach ($this->getUnsorted($object) as $item) {
                 $response['redraw_recommended'] = true;
-                $response['log'][] = "setting unassigned ".$entityClass.":{$object->getId()} sorting to {$sorting}";
-                $response['remap'][$object->getId()] = $sorting;
-                call_user_func([$object, $setter], $sorting++);
+                $response['log'][] = "setting unassigned ".$entityClass.":{$item->getId()} sorting to {$sorting}";
+                $response['remap'][$item->getId()] = $sorting;
+                call_user_func([$item, $setter], $sorting++);
             }
         }
 

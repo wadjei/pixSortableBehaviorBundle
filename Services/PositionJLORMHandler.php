@@ -40,6 +40,55 @@ class PositionJLORMHandler extends PositionHandler
     }
 
     /**
+     * One based sorting, not zero.
+     *
+     * @param object $object
+     * @param string $movePosition
+     * @param int    $lastPosition
+     *
+     * @return int
+     */
+    public function getPosition($object, $movePosition, $lastPosition)
+    {
+        $currentPosition = $this->getCurrentPosition($object);
+        $newPosition = 0;
+
+        switch ($movePosition) {
+            case 'up' :
+                if ($currentPosition > 1) {
+                    $newPosition = $currentPosition - 1;
+                }
+                break;
+
+            case 'down':
+                if ($currentPosition < $lastPosition) {
+                    $newPosition = $currentPosition + 1;
+                }
+                break;
+
+            case 'top':
+                if ($currentPosition > 1) {
+                    $newPosition = 1;
+                }
+                break;
+
+            case 'bottom':
+                if ($currentPosition < $lastPosition) {
+                    $newPosition = $lastPosition;
+                }
+                break;
+
+            default:
+                if (is_numeric($movePosition)) {
+                    $newPosition = $movePosition;
+                }
+
+        }
+
+        return $newPosition;
+    }
+
+    /**
      * @param object $entity
      * @return int
      */
@@ -53,8 +102,8 @@ class PositionJLORMHandler extends PositionHandler
             if ($parentEntityClass)
                 $entityClass = $parentEntityClass;
         }
-        
-        $groups      = $this->getSortableGroupsFieldByEntity($entityClass);
+
+        $groups = $this->getSortableGroupsFieldByEntity($entityClass);
 
         $cacheKey = $this->getCacheKeyForLastPosition($entity, $groups);
         if (!isset(self::$cacheLastPosition[$cacheKey])) {
