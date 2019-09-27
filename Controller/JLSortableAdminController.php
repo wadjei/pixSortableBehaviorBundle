@@ -11,12 +11,13 @@
 namespace Pix\SortableBehaviorBundle\Controller;
 
 use Doctrine\Common\Util\ClassUtils;
-use Pix\SortableBehaviorBundle\Services\PositionHandler;
+use Doctrine\ORM\EntityManagerInterface;
+use Psr\Log\LoggerInterface;
 use Sonata\AdminBundle\Controller\CRUDController;
+use Symfony\Component\DependencyInjection\ContainerInterface;
 use Symfony\Component\HttpFoundation\RedirectResponse;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
-use Doctrine\ORM\EntityManager;
 
 /**
  * Class SortableAdminController
@@ -25,6 +26,23 @@ use Doctrine\ORM\EntityManager;
  */
 class JLSortableAdminController extends CRUDController
 {
+    /** @var LoggerInterface */
+    private $logger;
+
+    /** @var EntityManagerInterface */
+    private $entityManager;
+
+    private $requestId;
+
+    public function setContainer(ContainerInterface $container = null)
+    {
+        parent::setContainer($container);
+
+        $this->logger = $this->getLogger();
+        $this->entityManager = $this->get('doctrine')->getEntityManager();
+        $this->requestId = md5(microtime(true) . mt_rand(0, 1000000));
+    }
+
     /**
      * Get the method to set this entitie's position
      *
@@ -91,9 +109,6 @@ class JLSortableAdminController extends CRUDController
     {
         $entityClass = get_class($object);
 
-        /** @var EntityManager $em */
-        $em = $this->get('doctrine')->getEntityManager();
-
         /** @var PositionHandler $positionHandler */
         $positionHandler = $this->get('pix_sortable_behavior.position');
         $positionField = $positionHandler->getPositionFieldByEntity($entityClass);
@@ -110,7 +125,32 @@ class JLSortableAdminController extends CRUDController
               FROM $entityClass e
               WHERE (e.$positionField < 1 OR e.$positionField IS NULL) $groupRestrict
 DQL;
-        return $em->createQuery($dql)->setParameters($filters['parameters'])->execute();
+        return $this->entityManager->createQuery($dql)->setParameters($filters['parameters'])->execute();
+    }
+
+    /**
+     * extract identifier for class
+     */
+    private function getIdInfo($class)
+    {
+        $metadata = $this->entityManager->getClassMetadata($class);
+
+        if (count($metadata->getIdentifier()) !== 1) {
+            $this->logger->critical(
+                __METHOD__.' used with unsupported entity - composite/no PK.',
+                [
+                    'class' => $class,
+                    'identifier' => $metadata->getIdentifier(),
+                ]
+            );
+            throw new \InvalidArgumentException('unsupported class');
+        }
+
+        return [
+
+            'idElement' => $metadata->getIdentifier()[0],
+            'idAccessor' => 'get' . ucfirst($metadata->getIdentifier()[0]),
+        ];
     }
 
     /**
@@ -149,6 +189,13 @@ DQL;
         $positionField = $positionHandler->getPositionFieldByEntity($entityClass);
         $setter = $this->getPositionSetter($entityClass);
 
+        try {
+            $idInfo = $this->getIdInfo($entityClass);
+        } catch (\InvalidArgumentException $e) {
+            $this->logger->info('creating 400 response');
+            return $this->renderJson('Invalid entity for sorting.', Response::HTTP_BAD_REQUEST);
+        }
+
         call_user_func([$object, $setter], $newPositionNumber);
         $this->admin->update($object);
 
@@ -166,12 +213,8 @@ DQL;
         $response['remap'] = [];
 
         if (!empty($shift)) {
-            /** @var EntityManager $em */
-            $em = $this->get('doctrine')->getEntityManager();
-
             /** @var EntityRepository $repository */
-            $repository = $em->getRepository($entityClass);
-
+            $repository = $this->entityManager->getRepository($entityClass);
             $filters = $this->getGroupFilter($object);
 
             if (!empty($filters['filters'])) {
@@ -183,14 +226,14 @@ DQL;
             $updateDql = <<<DQL
                 UPDATE $entityClass e
                   SET e.$positionField = (CASE
-                    WHEN e.id = :objectId THEN :newPosition
+                    WHEN e.{$idInfo['idElement']} = :objectId THEN :newPosition
                     WHEN e.$positionField BETWEEN :lowerBound AND :upperBound THEN e.$positionField + :shift
                     ELSE e.$positionField END
                    )
                   WHERE e.$positionField BETWEEN :lowerBound AND :upperBound $groupRestrict
 DQL;
             $reportDql = <<<DQL
-                SELECT e.id, e.$positionField
+                SELECT e.{$idInfo['idElement']}, e.$positionField
                   FROM $entityClass e
                   WHERE e.$positionField BETWEEN :lowerBound AND :upperBound $groupRestrict
 DQL;
@@ -198,7 +241,7 @@ DQL;
             $updateParameters = array_merge(
                 $filters['parameters'],
                 [
-                    'objectId' => $object->getId(),
+                    'objectId' => $object->{$idInfo['idAccessor']}(),
                     'lowerBound' => $lowerBound,
                     'upperBound' => $upperBound,
                     'newPosition' => $newPositionNumber,
@@ -214,39 +257,36 @@ DQL;
                 ]
             );
 
-            $em->createQuery($updateDql)->setParameters($updateParameters)->execute();
+            $this->entityManager->createQuery($updateDql)->setParameters($updateParameters)->execute();
 
-            $updates = $em
+            $updates = $this->entityManager
                 ->createQuery($reportDql)
                 ->setParameters($reportParameters)
                 ->execute()
                 ;
 
             foreach ($updates as $update) {
-                $response['remap'][$update['id']] = $update[$positionField];
+                $response['remap'][$update[$idInfo['idElement']]] = $update[$positionField];
             }
 
             $sorting = $positionHandler->getLastPosition($object) + 1;
             foreach ($this->getUnsorted($object) as $item) {
+                $this->logger->info("setting unassigned ".$entityClass.":{$item->{$idInfo['idAccessor']}()} sorting to {$sorting}");
                 $response['redraw_recommended'] = true;
-                $response['log'][] = "setting unassigned ".$entityClass.":{$item->getId()} sorting to {$sorting}";
-                $response['remap'][$item->getId()] = $sorting;
+                $response['remap'][$item->{$idInfo['idAccessor']}()] = $sorting;
                 call_user_func([$item, $setter], $sorting++);
             }
 
-            $em->flush();
-            $response['log'][] = "flushing entities";
+            $this->entityManager->flush();
+            $this->logger->info('flushing entities');
             $response['message'] = 'The page order has been updated successfully.';
 
-            if ($logger = $this->get('logger')) {
-                /** @var \Psr\Log\LoggerInterface $logger */
-                $logger->debug(
-                    'Move complete for '.$entityClass.':'.$object->getId(),
-                    [
-                        'response' => $response,
-                    ]
-                );
-            }
+            $this->logger->debug(
+                'Move complete for '.$entityClass.':'.$object->{$idInfo['idAccessor']}(),
+                [
+                    'response' => $response,
+                ]
+            );
         }
 
         if ($this->isXmlHttpRequest()) {
@@ -276,46 +316,49 @@ DQL;
         $response = [
             'redraw_recommended' => false,
             'remap' => [],
-            'log' => [],
         ];
+
         $parameters = json_decode($request->getContent(), true);
         $positionHandler = $this->get('pix_sortable_behavior.position');
 
         $entityClass = $this->admin->getClass();
-        $positionField = $positionHandler->getPositionFieldByEntity($entityClass);
         $setter = $this->getPositionSetter($entityClass);
 
-        /** @var EntityManager $em */
-        $em = $this->get('doctrine')->getEntityManager();
-
         /** @var EntityRepository $repository */
-        $repository = $em->getRepository($entityClass);
+        $repository = $this->entityManager->getRepository($entityClass);
+
+        try {
+            $idInfo = $this->getIdInfo($entityClass);
+        } catch (\InvalidArgumentException $e) {
+            $this->logger->info('creating 400 response');
+            return $this->renderJson('Invalid entity for sorting.', Response::HTTP_BAD_REQUEST);
+        }
 
         if (empty($parameters['order'])) {
             $response['message'] = 'An empty reorder request was sent.';
             $status = 400;
-        }
-        else {
+        } else {
             /* @todo allow for non-id primary keys */
             $sorting = empty($parameters['first_sorting']) ? 1 : $parameters['first_sorting'];
+
             foreach ($parameters['order'] as $objectId) {
                 $object = $repository->find($objectId);
-                $response['log'][] = "updating ".$entityClass.":{$object->getId()} from {$object->getSorting()} to {$sorting}";
-                $response['remap'][$object->getId()] = $sorting;
+                $this->logger->info("updating ".$entityClass.":{$object->{$idInfo['idAccessor']}()} from {$object->getSorting()} to {$sorting}");
+                $response['remap'][$object->{$idInfo['idAccessor']}()] = $sorting;
                 call_user_func([$object, $setter], $sorting++);
             }
 
             // amend sorting of all items with sort set to 0 (assume items are grouped correctly so $order is appropiate)
             foreach ($this->getUnsorted($object) as $item) {
                 $response['redraw_recommended'] = true;
-                $response['log'][] = "setting unassigned ".$entityClass.":{$item->getId()} sorting to {$sorting}";
-                $response['remap'][$item->getId()] = $sorting;
+                $this->logger->info("setting unassigned ".$entityClass.":{$item->{$idInfo['idAccessor']}()} sorting to {$sorting}");
+                $response['remap'][$item->{$idInfo['idAccessor']}()] = $sorting;
                 call_user_func([$item, $setter], $sorting++);
             }
         }
 
-        $em->flush();
-        $response['log'][] = "flushing entities";
+        $this->entityManager->flush();
+        $this->logger->info('flushing entities');
         $response['message'] = 'The page order has been updated successfully.';
 
         if ($logger = $this->get('logger')) {
